@@ -1,14 +1,27 @@
-"""This file simply follows the POS-tagging tutorial at https://allennlp.org/tutorials"""
+"""
+This file adapts the POS-tagging tutorial at https://allennlp.org/tutorials to apply it to some
+more realistic data. The English UD tree bank: https://universaldependencies.org/treebanks/en_ewt/index.html. 
 
-from typing import Dict, List, Iterator
+This script makes use of hard-coded parameters, instead of the recommended AllenNLP config-file approach.
+The current config get's poor results. Dev set accuracy of ~87% after terminating.
+TODO: * Use the jsonnet config approach to setting parameters.
+      * Use pre-trained word embeddings
+      * Insect the AllenNLP LSTM models available parameters (dropout, layers, bi-directional etc.)
+"""
+
+from typing import Dict, List, Iterator, Tuple
 
 import torch
 import torch.optim as optim
+
+import conllu
+
 from allennlp.data import Instance
-from allennlp.data.fields import TextField, SequenceLabelField
+from allennlp.data.fields import TextField, SequenceLabelField, MetadataField, Field
 from allennlp.data.dataset_readers import DatasetReader
+from allennlp.data.dataset_readers.universal_dependencies import UniversalDependenciesDatasetReader, lazy_parse
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
-from allennlp.data.tokenizers import Token
+from allennlp.data.tokenizers import Token, Tokenizer
 from allennlp.data.vocabulary import Vocabulary
 from allennlp.data.iterators import BucketIterator
 from allennlp.models import Model
@@ -21,10 +34,7 @@ from allennlp.common.file_utils import cached_path
 from allennlp.common.params import Params
 from allennlp.training.trainer import Trainer
 
-class PosDatasetReader(DatasetReader):
-    """ Reads a file of POS-annotated sentences, each line with a sentence on the format:
-        WORD###POS WORD###POS WORD###POS
-    """
+class UDDatasetReader(DatasetReader):
 
     def __init__(self, 
                 token_indexers: Dict[str, TokenIndexer] = {"tokens" : SingleIdTokenIndexer()}
@@ -47,11 +57,11 @@ class PosDatasetReader(DatasetReader):
 
     def _read(self, file_path: str) -> Iterator[Instance]:
         """ Creates and iterator over instances from a file path """
-        with open(file_path) as f:
-            for line in f:
-                pairs = line.split()
-                words, tags = zip(*(pair.split("###") for pair in pairs))
-                yield self.text_to_instance([Token(word) for word in words], tags)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for token_list in conllu.parse_incr(f):
+                sentence = [token['form'] for token in token_list]
+                pos_tags = [token['upostag'] for token in token_list]
+                yield self.text_to_instance([Token(word) for word in sentence], pos_tags)
 
 class POSTagger(Model):
     """ A POS-tagger model 
@@ -75,7 +85,8 @@ class POSTagger(Model):
 
     def forward(self, 
                 sentence: Dict[str, torch.tensor],
-                labels: torch.tensor = None
+                labels: torch.tensor = None,
+                **kwargs
         ) -> Dict[str, torch.tensor]:
 
         mask = get_text_field_mask(sentence)
@@ -96,20 +107,15 @@ class POSTagger(Model):
         """ Returns a dictionary of metrics associated with the model """
         return {'accuracy' : self.accuracy.get_metric(reset)}
 
-
 if __name__ == "__main__":
-    reader = PosDatasetReader()
-    train_dataset = reader.read(cached_path(
-        'https://raw.githubusercontent.com/allenai/allennlp'
-        '/master/tutorials/tagger/training.txt'))
-    validation_dataset = reader.read(cached_path(
-        'https://raw.githubusercontent.com/allenai/allennlp'
-        '/master/tutorials/tagger/validation.txt'))
+    reader = UDDatasetReader()
+    train_dataset = reader.read('data/UD_English-EWT/en_ewt-ud-train.conllu')
+    validation_dataset = reader.read('data/UD_English-EWT/en_ewt-ud-dev.conllu')
 
     vocab = Vocabulary.from_instances(train_dataset + validation_dataset)
 
-    EMBEDDING_DIM = 6
-    HIDDEN_DIM = 6
+    EMBEDDING_DIM = 100
+    HIDDEN_DIM = 200
 
     model_params = Params({
         'type' : 'lstm',
@@ -123,9 +129,9 @@ if __name__ == "__main__":
 
     model = POSTagger(word_embedding, lstm, vocab)
 
-    optimizer = optim.SGD(model.parameters(), lr=0.1)
+    optimizer = optim.Adam(model.parameters())
     
-    iterator = BucketIterator(batch_size=2, sorting_keys=[('sentence', 'num_tokens')])
+    iterator = BucketIterator(batch_size=64, sorting_keys=[('sentence', 'num_tokens')])
     iterator.index_with(vocab)
 
     trainer = Trainer(
@@ -135,7 +141,7 @@ if __name__ == "__main__":
         train_dataset = train_dataset,
         validation_dataset = validation_dataset,
         patience = 10,
-        num_epochs = 1000
+        num_epochs = 100
     )
 
     trainer.train()
